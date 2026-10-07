@@ -1,0 +1,82 @@
+# Release Radar settings. Secrets (webhook URL, API keys) never go here:
+# they come from environment variables / GitHub secrets / a local .env file.
+
+country = "us"          # Apple storefront + YouTube region
+footer = "Release Radar · US"
+
+# Apple/iTunes genre charts to watch (name = Apple genre id).
+# Each one is the US top-100 songs chart for that genre.
+[genres]
+"Pop" = 14
+"Hip-Hop/Rap" = 18
+"R&B/Soul" = 15
+"Country" = 6
+"Latin" = 12
+"Dance" = 17
+"Electronic" = 7
+"Alternative" = 20
+"Rock" = 21
+"Metal" = 1153
+"Indie Pop" = 1131
+"K-Pop" = 51
+"Afrobeats" = 1232
+"Reggae" = 24
+"Christian" = 22
+"Singer/Songwriter" = 10
+"Jazz" = 11
+"Blues" = 2
+"Soundtrack" = 16
+"Classical" = 5
+
+[alerts]
+new_drop_max_age_hours = 48      # NEW DROP: only releases this fresh
+new_drop_min_heat = 38           # NEW DROP: artist heat (0-100) needed; 38 = top ~5 of any genre chart or anywhere on the Apple top 100
+viral_max_age_days = 14          # GOING VIRAL: only songs released within this window
+viral_threshold = 55             # GOING VIRAL: score (0-100) needed to alert
+viral_after_new_drop_hours = 6   # wait this long before a NEW DROP can also go VIRAL
+max_per_run = 8
+max_new_drops_per_day = 18
+max_viral_per_day = 12
+max_viral_per_artist_per_day = 1
+bootstrap_top_n = 5              # first run: post a summary of the top N instead of alerting
+
+# Viral score weights (relative; they don't need to add up to 100).
+[weights]
+artist_heat = 30
+chart_momentum = 30
+youtube = 20
+cross_platform = 15
+reddit = 5
+
+[watchlist]
+hot_artist_days = 30       # forget chart artists after this many days off the charts
+max_artists = 400          # watch at most this many artists (hottest first)
+batch_size = 50            # artist ids per iTunes lookup request
+per_artist_limit = 5       # newest songs fetched per artist
+manual_artist_heat = 60    # heat given to artists listed in artists.txt
+itunes_pause_seconds = 3.2 # iTunes allows ~20 requests/minute
+
+[deezer]
+rank_lookups_per_run = 60
+date_lookups_per_run = 30
+
+[youtube]
+max_results = 200          # trending music videos to read (50 per request, 1 quota unit each)
+
+[reddit]
+subreddits = ["hiphopheads", "popheads", "indieheads"]
+
+[filters]
+# Titles matching these (case-insensitive regex) are ignored everywhere.
+exclude_title = [
+  '\[mixed\]', '\(mixed\)', '\bsped up\b', '\bspeed up\b', '\bslowed', '\(slow\)', 'reverb', '\bnightcore\b',
+  '\binstrumental\b', '\bkaraoke\b', '\ba\s?cappella\b', '\bacapella\b', '\b8d audio\b',
+  '\blive (at|from|in)\b', '\bcommentary\b', '\binterlude\b', '\bskit\b',
+  '[0-9a-f]{8}[ -][0-9a-f]{4}[ -][0-9a-f]{4}',   # auto-generated uploads with UUID titles
+]
+# Extra patterns that only block NEW DROP alerts (they can still go viral).
+exclude_new_drop_title = [
+  '\bremix\b', '\bre-?edit\b', '\bextended\b', '\bradio edit\b', '\bacoustic\b',
+  '\blive\b', '\bdemo\b', '\bremaster', '\bversion\)', '\bedit\)',
+]
+exclude_artists = ["Various Artists"]

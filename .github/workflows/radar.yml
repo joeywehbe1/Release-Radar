@@ -1,0 +1,61 @@
+name: Release Radar
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 min (GitHub may start it a few minutes late)
+  workflow_dispatch:          # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write             # to save state on the bot-state branch
+
+concurrency:
+  group: release-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Load saved state
+        run: |
+          mkdir -p state
+          if git fetch --quiet --depth=1 origin bot-state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > state/state.json
+            echo "Loaded saved state ($(wc -c < state/state.json) bytes)"
+          else
+            echo "No saved state yet: this run is the bootstrap."
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check sources and post alerts
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python -m radar run --state state/state.json
+
+      # The bot-state branch always holds a single commit with the latest state.json,
+      # so main's history stays clean. Runs even if the step above failed part-way,
+      # so songs that were already posted are never posted twice.
+      - name: Save state
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -s state/state.json ]; then echo "No state to save"; exit 0; fi
+          cd state
+          git init -q -b bot-state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -q -m "Radar state $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bot-state

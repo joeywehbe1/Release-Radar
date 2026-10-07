@@ -1,0 +1,5 @@
+# Extra artists to always watch for new drops, even when they're not charting.
+# One Apple Music artist id per line. Find it in the artist's Apple Music URL:
+#   https://music.apple.com/us/artist/drake/271256  ->  271256
+# Example (remove the leading # to enable):
+# 271256   # Drake
