@@ -29,15 +29,16 @@ footer = "Release Radar · US"
 "Classical" = 5
 
 [alerts]
-new_drop_max_age_hours = 48      # NEW DROP: only releases this fresh
+new_drop_max_age_hours = 24      # NEW DROP: only releases this fresh
 new_drop_min_heat = 38           # NEW DROP: artist heat (0-100) needed; 38 = top ~5 of any genre chart or anywhere on the Apple top 100
-viral_max_age_days = 14          # GOING VIRAL: only songs released within this window
+viral_max_age_days = 3           # GOING VIRAL: only songs released within this window
 viral_threshold = 55             # GOING VIRAL: score (0-100) needed to alert
 viral_after_new_drop_hours = 6   # wait this long before a NEW DROP can also go VIRAL
 max_per_run = 8
-max_new_drops_per_day = 18
+max_new_drops_per_day = 25
 max_viral_per_day = 12
 max_viral_per_artist_per_day = 1
+max_coming_soon_per_day = 6
 bootstrap_top_n = 5              # first run: post a summary of the top N instead of alerting
 
 # Viral score weights (relative; they don't need to add up to 100).
@@ -55,6 +56,7 @@ batch_size = 50            # artist ids per iTunes lookup request
 per_artist_limit = 5       # newest songs fetched per artist
 manual_artist_heat = 60    # heat given to artists listed in artists.txt
 itunes_pause_seconds = 3.2 # iTunes allows ~20 requests/minute
+early_storefronts = ["nz"] # also check these Apple stores; New Zealand hits midnight ~17h before the US
 
 [deezer]
 rank_lookups_per_run = 60
@@ -78,5 +80,10 @@ exclude_title = [
 exclude_new_drop_title = [
   '\bremix\b', '\bre-?edit\b', '\bextended\b', '\bradio edit\b', '\bacoustic\b',
   '\blive\b', '\bdemo\b', '\bremaster', '\bversion\)', '\bedit\)',
+]
+# Extra patterns that block COMING SOON alerts (reissues, live albums, deluxe re-packages).
+exclude_upcoming_title = [
+  '\bdeluxe\b', '\banniversary\b', '\bremaster', '\blive\b', '\bedition\b', '\bgreatest hits\b',
+  '\bbest of\b', '\bessentials\b', '\bexpanded\b', '\bcollection\b',
 ]
 exclude_artists = ["Various Artists"]

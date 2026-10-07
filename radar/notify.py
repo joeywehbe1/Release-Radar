@@ -14,7 +14,8 @@ from radar.models import artwork_600, clean_title, primary_artist_display
 log = logging.getLogger(__name__)
 
 USERNAME = "Release Radar"
-COLORS = {"new": 0x2ECC71, "viral": 0xFF5A1F, "info": 0x5865F2}
+COLORS = {"new": 0x2ECC71, "viral": 0xFF5A1F, "soon": 0x9B59B6, "info": 0x5865F2}
+STOREFRONT_NAMES = {"nz": "New Zealand", "au": "Australia", "us": "the US", "gb": "the UK", "ca": "Canada"}
 
 
 # ---------------------------------------------------------------- formatting helpers
@@ -130,7 +131,33 @@ def alert_payload(alert, now: int, cfg: dict) -> dict:
                 desc += "\nIncludes " + " · ".join(names)
         if alert.also:
             desc += "\nAlso out: " + " · ".join(f"*{x['title']}*" for x in alert.also[:3])
+        live, home = t.get("live") or {}, cfg["country"]
+        early = [cc for cc in live if cc != home]
+        if early and home not in live:
+            where = ", ".join(STOREFRONT_NAMES.get(cc, cc.upper()) for cc in early)
+            desc += f"\n🌏 Out now in {where} · reaches {STOREFRONT_NAMES.get(home, home.upper())} at midnight local time"
         author = f"🆕 NEW DROP{genre}"
+    elif alert.kind == "soon":
+        artist = primary_artist_display(t["artist"])
+        title, url = f"{artist} — {_collection_name(t)}", t.get("collection_url")
+        count = t.get("track_count") or 1
+        desc = f"**{release_kind(t)}**" + (f" · {count} tracks" if count > 1 else "")
+        desc += f"\nOut **<t:{t['release']}:D>** (<t:{t['release']}:R>) · just listed for pre-order"
+        embed = {
+            "author": {"name": _trunc(f"📅 COMING SOON{genre}", 256)},
+            "title": _trunc(title, 256), "description": desc, "color": COLORS["soon"],
+            "fields": [
+                {"name": "Artist heat", "value": f"{round(alert.heat)}/100", "inline": True},
+                {"name": "Pre-add", "value": f"[Apple Music]({url})" if url else "Apple Music", "inline": True},
+            ],
+            "footer": {"text": cfg.get("footer", USERNAME)}, "timestamp": _iso(now),
+        }
+        if url:
+            embed["url"] = url
+        art = artwork_600(t.get("artwork"))
+        if art:
+            embed["thumbnail"] = {"url": art}
+        return {"username": USERNAME, "embeds": [embed], "allowed_mentions": {"parse": []}}
     else:
         title = f"{t['artist']} — {t['title']}"
         url = t.get("apple_url") or (t.get("youtube") or {}).get("url")
@@ -178,6 +205,7 @@ def online_payload(result, now: int, cfg: dict, top_n: int | None = None) -> dic
         "Watching " + ", ".join(sources) + ".",
         "🆕 **NEW DROP**: a fresh release from an artist who's charting right now",
         "🔥 **GOING VIRAL**: a new song gaining fast momentum across platforms",
+        "📅 **COMING SOON**: a hot artist's release, the moment it's listed for pre-order",
     ]
     top = result.ranked[:top_n]
     if top:

@@ -23,6 +23,11 @@ def _strip_uo(url: str | None) -> str | None:
     return re.sub(r"[?&]uo=\d+$", "", url) if url else url
 
 
+def to_storefront(url: str | None, cc: str) -> str | None:
+    """music.apple.com/nz/... -> music.apple.com/us/... (ids are the same in every country)."""
+    return re.sub(r"(music\.apple\.com/)[a-z]{2}/", rf"\g<1>{cc}/", url) if url else url
+
+
 def album_url(url: str | None) -> str | None:
     """Collection URLs from search/lookup carry '?i=<track>'; drop it to land on the album page."""
     return url.split("?", 1)[0] if url else url
@@ -78,8 +83,9 @@ def _track_candidate(r: dict, source: str) -> Candidate:
 
 
 def latest_songs(session: requests.Session, cc: str, artist_ids: list[str], *, batch_size: int,
-                 per_artist: int, throttle: Throttle, pause: float) -> list[Candidate]:
-    """Newest songs for each artist id (batched lookups). A failed batch is skipped, not fatal."""
+                 per_artist: int, throttle: Throttle, pause: float, home_cc: str | None = None) -> list[Candidate]:
+    """Newest songs for each artist id in storefront `cc` (batched lookups; Apple only returns songs
+    that are already out there). Links point at `home_cc`. A failed batch is skipped, not fatal."""
     out = []
     for start in range(0, len(artist_ids), batch_size):
         chunk = artist_ids[start:start + batch_size]
@@ -90,11 +96,43 @@ def latest_songs(session: requests.Session, cc: str, artist_ids: list[str], *, b
                 "limit": per_artist, "country": cc,
             })
         except Exception as exc:  # keep going with the other batches
-            log.warning("iTunes lookup batch %d failed: %s", start // batch_size + 1, exc)
+            log.warning("iTunes %s lookup batch %d failed: %s", cc.upper(), start // batch_size + 1, exc)
             continue
         for r in data.get("results", []):
             if r.get("wrapperType") == "track" and r.get("kind") == "song":
-                out.append(_track_candidate(r, "watchlist"))
+                c = _track_candidate(r, "watchlist")
+                c.extra["storefront"] = cc
+                if home_cc and cc != home_cc:
+                    c.url, c.collection_url = to_storefront(c.url, home_cc), to_storefront(c.collection_url, home_cc)
+                out.append(c)
+    return out
+
+
+def upcoming_releases(session: requests.Session, cc: str, artist_ids: list[str], *, batch_size: int,
+                      throttle: Throttle, pause: float, now: int) -> list[Candidate]:
+    """Announced albums/singles (pre-orders): collections whose release date is still ahead."""
+    out = []
+    for start in range(0, len(artist_ids), batch_size):
+        throttle.wait("itunes", pause)
+        try:
+            data = get_json(session, LOOKUP, params={
+                "id": ",".join(artist_ids[start:start + batch_size]), "entity": "album", "sort": "recent",
+                "limit": 3, "country": cc,
+            })
+        except Exception as exc:
+            log.warning("iTunes upcoming batch %d failed: %s", start // batch_size + 1, exc)
+            continue
+        for r in data.get("results", []):
+            release = parse_time(r.get("releaseDate"))
+            if r.get("wrapperType") != "collection" or not release or release <= now:
+                continue
+            out.append(Candidate(
+                source="upcoming", artist=r.get("artistName", ""), title=r.get("collectionName", ""),
+                release=release, genre=r.get("primaryGenreName"),
+                artist_id=str(r["artistId"]) if r.get("artistId") else None, artwork=r.get("artworkUrl100"),
+                collection=r.get("collectionName"), collection_id=str(r["collectionId"]),
+                collection_url=album_url(r.get("collectionViewUrl")), track_count=r.get("trackCount"),
+            ))
     return out
 
 

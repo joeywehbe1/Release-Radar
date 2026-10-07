@@ -1,5 +1,5 @@
 import pytest
-from conftest import DAY, HOUR, T0, FakeFetchers, RecordingNotifier, chart, song, video
+from conftest import DAY, HOUR, T0, FakeFetchers, RecordingNotifier, chart, preorder, song, video
 
 from radar import notify, pipeline, state
 from radar.models import Candidate
@@ -56,6 +56,64 @@ def test_new_drop_is_posted_once(cfg):
     assert st["sent"][-1][1] == "new"
     _, notifier2 = run(cfg, st, fetchers, T0 + 15 * 60)
     assert notifier2.payloads == []
+
+
+def test_friday_release_with_placeholder_time_is_posted_immediately(cfg):
+    # Out at 04:00 UTC, but Apple stamps it 12:00 UTC the same day.
+    st = bootstrapped(cfg, FakeFetchers(charts=hot_charts()))
+    fetchers = FakeFetchers(charts=hot_charts(), watch=[song("Star", "Friday Drop", release=T0 + 8 * HOUR)])
+    result, notifier = run(cfg, st, fetchers, T0)
+    assert [a.kind for a in result.alerts] == ["new"]
+    assert st["tracks"]["star|friday drop"]["release"] == T0   # "released just now", not "in 8 hours"
+    assert f"<t:{T0}:R>" in str(notifier.payloads[0])
+    # later runs keep the first-seen time instead of jumping to Apple's placeholder
+    run(cfg, st, fetchers, T0 + 9 * HOUR)
+    assert st["tracks"]["star|friday drop"]["release"] == T0
+
+
+def test_fast_check_only_looks_for_new_drops(cfg):
+    st = bootstrapped(cfg, FakeFetchers(charts=hot_charts()))
+    positions_before = {k: dict(t["pos"]) for k, t in st["tracks"].items()}
+    fetchers = FakeFetchers(charts=hot_charts(), watch=[song("Star", "Brand New")],
+                            upcoming=[preorder("Star", "Next Album")])
+    result = pipeline.run_cycle(cfg, st, fetchers, T0, fast=True)
+    assert fetchers.calls == []                       # no charts, no pre-order lookups
+    assert [a.kind for a in result.eligible] == ["new"]
+    assert {k: st["tracks"][k]["pos"] for k in positions_before} == positions_before
+
+
+def test_new_zealand_release_posts_early_and_only_once(cfg):
+    st = bootstrapped(cfg, FakeFetchers(charts=hot_charts()))
+    nz = song("Star", "Global Drop", release=T0 + 20 * HOUR)    # Apple's placeholder: tomorrow
+    nz.extra["storefront"] = "nz"
+    result, notifier = run(cfg, st, FakeFetchers(charts=hot_charts(), watch=[nz]), T0)
+    assert [a.kind for a in result.alerts] == ["new"]
+    assert "Out now in New Zealand" in notifier.payloads[0]["embeds"][0]["description"]
+    # 17 hours later it reaches the US store: no second alert
+    us = song("Star", "Global Drop", release=T0 + 20 * HOUR)
+    us.extra["storefront"] = "us"
+    _, notifier2 = run(cfg, st, FakeFetchers(charts=hot_charts(), watch=[us]), T0 + 17 * HOUR)
+    assert notifier2.payloads == []
+    assert set(st["tracks"]["star|global drop"]["live"]) == {"nz", "us"}
+
+
+def test_coming_soon_skips_existing_preorders_then_alerts_new_ones(cfg):
+    st = bootstrapped(cfg, FakeFetchers(charts=hot_charts()))
+    listed = [preorder("Star", "Old Announcement"), preorder("Star", "Hits (Deluxe Edition)")]
+    _, first = run(cfg, st, FakeFetchers(charts=hot_charts(), upcoming=listed), T0)
+    assert first.payloads == []                          # first check only records what's listed
+    assert st["upcoming_seeded"]
+    fresh = [*listed, preorder("Star", "Brand New Album"), preorder("Star", "Brand New Album", collection_id="clean")]
+    result, notifier = run(cfg, st, FakeFetchers(charts=hot_charts(), upcoming=fresh), T0 + 31 * 60)
+    assert [a.kind for a in result.alerts] == ["soon"]   # clean + explicit editions alert once
+    embed = notifier.payloads[0]["embeds"][0]
+    assert embed["author"]["name"].startswith("📅 COMING SOON")
+    assert embed["title"] == "Star — Brand New Album"
+    assert f"<t:{T0 + 14 * DAY}:D>" in embed["description"]
+    # not again, and pre-order lookups wait 30 minutes between checks
+    fetchers = FakeFetchers(charts=hot_charts(), upcoming=fresh)
+    _, again = run(cfg, st, fetchers, T0 + 32 * 60)
+    assert again.payloads == [] and "upcoming" not in fetchers.calls
 
 
 def test_cold_artists_and_old_or_junk_songs_are_ignored(cfg):

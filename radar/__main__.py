@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     run_p = sub.add_parser("run", help="check every source once and post new alerts")
     run_p.add_argument("--dry-run", action="store_true", help="print what would be posted; don't post or save state")
+    run_p.add_argument("--fast", action="store_true", help="quick check: only hot artists' newest songs (NEW DROP)")
     run_p.add_argument("--state", default="state/state.json", help="state file (default: state/state.json)")
     run_p.add_argument("-v", "--verbose", action="store_true")
     sub.add_parser("test-webhook", help="post a test message to the webhook")
@@ -50,9 +51,12 @@ def run(args, cfg: dict, session) -> int:
     now = int(time.time())
     started = time.monotonic()
 
-    result = pipeline.run_cycle(cfg, state, pipeline.LiveFetchers(cfg, session), now)
+    fast = args.fast and not state_mod.is_bootstrap(state)
+    if args.fast and not fast:
+        log.info("No saved state yet, so doing a full check instead of a quick one")
+    result = pipeline.run_cycle(cfg, state, pipeline.LiveFetchers(cfg, session), now, fast=fast)
     _summary(result, cfg)
-    if not any(result.stats.get(k) for k in ("charts", "watchlist", "deezer", "youtube")):
+    if not fast and not any(result.stats.get(k) for k in ("charts", "watchlist", "deezer", "youtube")):
         log.error("Every source failed; nothing to do this run.")
         return 1
 
@@ -74,13 +78,13 @@ def run(args, cfg: dict, session) -> int:
 
 
 def _summary(result: pipeline.CycleResult, cfg: dict) -> None:
-    kinds = {"new": 0, "viral": 0}
+    kinds = {"new": 0, "viral": 0, "soon": 0}
     for a in result.eligible:
         kinds[a.kind] += 1
     plan = ("bootstrap: 1 summary message, the rest marked as seen" if result.bootstrap
             else f"posting {len(result.alerts)} this run")
-    log.info("Scored %d recent songs; eligible: %d new drops, %d viral (threshold %s); %s",
-             len(result.ranked), kinds["new"], kinds["viral"], cfg["alerts"]["viral_threshold"], plan)
+    log.info("Scored %d recent songs; eligible: %d new drops, %d viral (threshold %s), %d coming soon; %s",
+             len(result.ranked), kinds["new"], kinds["viral"], cfg["alerts"]["viral_threshold"], kinds["soon"], plan)
     for score, t in result.ranked[:10]:
         p = t["parts"]
         log.info("  %5.1f  %-45.45s heat %3.0f  mom %.2f  yt %.2f  x %.2f  rd %.0f",

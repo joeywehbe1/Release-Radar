@@ -21,6 +21,9 @@ def empty() -> dict:
         "releases": {},       # "rel:<collection id>" -> time a NEW DROP was posted
         "sent": [],           # [time, kind, key] for daily caps
         "dates": {},          # "apple:<id>" / "deezer:<id>" -> [release time, cached at]
+        "upcoming": {},       # "up:<artist>|<title>" -> [first seen, release time] for COMING SOON
+        "upcoming_seeded": False,
+        "upcoming_checked": 0,
     }
 
 
@@ -67,3 +70,4 @@ def prune(state: dict, now: int, cfg: dict) -> None:
     state["releases"] = {k: v for k, v in state["releases"].items() if now - v <= CACHE_DAYS * DAY}
     state["sent"] = [s for s in state["sent"] if now - s[0] <= 2 * DAY]
     state["dates"] = {k: v for k, v in state["dates"].items() if now - v[1] <= CACHE_DAYS * DAY}
+    state["upcoming"] = {k: v for k, v in state["upcoming"].items() if now - (v[1] or v[0]) <= 7 * DAY}

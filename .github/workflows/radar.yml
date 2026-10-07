@@ -2,8 +2,14 @@ name: Release Radar
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 min (GitHub may start it a few minutes late)
+    - cron: "*/5 * * * *"     # full check every 5 min (GitHub may start it a few minutes late)
+    - cron: "17 10 * * 4"     # Thursday burst: New Zealand midnight on release day (11:00-12:00 UTC)
+    - cron: "17 3 * * 5"      # Friday burst: US midnight on release day (04:00-05:00 UTC)
   workflow_dispatch:          # "Run workflow" button in the Actions tab
+    inputs:
+      burst_minutes:
+        description: "Check about every minute for this many minutes (0 = one full check)"
+        default: "0"
 
 permissions:
   contents: write             # to save state on the bot-state branch
@@ -15,7 +21,7 @@ concurrency:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
 
@@ -40,22 +46,24 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYTHONUNBUFFERED: "1"
-        run: python -m radar run --state state/state.json
+          SCHEDULE: ${{ github.event.schedule }}
+          BURST_INPUT: ${{ inputs.burst_minutes }}
+        run: |
+          case "$SCHEDULE" in
+            "17 10 * * 4"|"17 3 * * 5") minutes=150 ;;   # covers both summer and winter time
+            *) minutes="${BURST_INPUT:-0}" ;;
+          esac
+          if [ "$minutes" -gt 0 ]; then
+            bash .github/burst.sh "$minutes"
+          else
+            timeout 10m python -m radar run --state state/state.json
+          fi
 
-      # The bot-state branch always holds a single commit with the latest state.json,
-      # so main's history stays clean. Runs even if the step above failed part-way,
-      # so songs that were already posted are never posted twice.
+      # Runs even if the step above failed part-way, so posted songs are never posted twice.
       - name: Save state
         if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ ! -s state/state.json ]; then echo "No state to save"; exit 0; fi
-          cd state
-          git init -q -b bot-state
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git commit -q -m "Radar state $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bot-state
+        run: bash .github/save-state.sh

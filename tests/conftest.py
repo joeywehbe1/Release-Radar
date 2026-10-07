@@ -38,6 +38,12 @@ def song(artist, title, *, artist_id="1", release=T0 - 2 * HOUR, collection=None
                      extra={"collection_artist": artist})
 
 
+def preorder(artist, title, *, artist_id="1", release=T0 + 14 * DAY, collection_id=None, track_count=12):
+    return Candidate(source="upcoming", artist=artist, title=title, release=release, artist_id=artist_id,
+                     genre="Pop", collection=title, collection_id=collection_id or f"pre-{title}",
+                     collection_url=f"https://music.apple.com/us/album/{title}", track_count=track_count)
+
+
 def video(artist, title, views, *, published=T0 - DAY, pos=1):
     return Candidate(source="youtube", artist=artist, title=title, position=pos, release=published,
                      extra={"video_id": f"v-{title}", "yt_url": f"https://www.youtube.com/watch?v={title}",
@@ -47,13 +53,20 @@ def video(artist, title, views, *, published=T0 - DAY, pos=1):
 class FakeFetchers:
     """Same interface as pipeline.LiveFetchers; each field is a callable returning fresh candidates."""
 
-    def __init__(self, charts=(), watch=(), dz=(), yt=(), rd=(), deezer_ranks=None, apple_search=None):
+    def __init__(self, charts=(), watch=(), dz=(), yt=(), rd=(), deezer_ranks=None, apple_search=None, upcoming=()):
         self._charts, self._watch, self._dz, self._yt, self._rd = charts, watch, dz, yt, rd
+        self._upcoming = upcoming
         self.deezer_ranks = deezer_ranks or {}
         self.searches = apple_search or {}
+        self.calls = []
 
     def charts(self):
+        self.calls.append("charts")
         return [copy.copy(c) for c in self._charts]
+
+    def upcoming(self, artist_ids, now):
+        self.calls.append("upcoming")
+        return [copy.copy(c) for c in self._upcoming if c.artist_id in artist_ids]
 
     def watchlist(self, artist_ids):
         return [copy.copy(c) for c in self._watch if c.artist_id in artist_ids]
