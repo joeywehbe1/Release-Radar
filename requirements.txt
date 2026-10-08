@@ -1,1 +1,2 @@
 requests>=2.31
+tzdata  # time zone data for Windows; Linux already has it

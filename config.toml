@@ -38,7 +38,6 @@ max_per_run = 8
 max_new_drops_per_day = 25
 max_viral_per_day = 12
 max_viral_per_artist_per_day = 1
-max_coming_soon_per_day = 6
 bootstrap_top_n = 5              # first run: post a summary of the top N instead of alerting
 
 # Viral score weights (relative; they don't need to add up to 100).
@@ -56,7 +55,16 @@ batch_size = 50            # artist ids per iTunes lookup request
 per_artist_limit = 5       # newest songs fetched per artist
 manual_artist_heat = 60    # heat given to artists listed in artists.txt
 itunes_pause_seconds = 3.2 # iTunes allows ~20 requests/minute
-early_storefronts = ["nz"] # also check these Apple stores; New Zealand hits midnight ~17h before the US
+early_storefronts = ["nz"] # also check if releases are out in these Apple stores; NZ hits midnight ~17h before the US
+
+# Fast checking around release time: every day, from `lead_minutes` before local midnight in each
+# zone until `tail_minutes` after (longer on Fridays, the big release day). Times follow daylight saving.
+[bursts]
+zones = ["Pacific/Auckland", "America/New_York"]
+lead_minutes = 50
+tail_minutes = 40
+friday_tail_minutes = 100
+interval_seconds = 20
 
 [deezer]
 rank_lookups_per_run = 60
@@ -80,10 +88,5 @@ exclude_title = [
 exclude_new_drop_title = [
   '\bremix\b', '\bre-?edit\b', '\bextended\b', '\bradio edit\b', '\bacoustic\b',
   '\blive\b', '\bdemo\b', '\bremaster', '\bversion\)', '\bedit\)',
-]
-# Extra patterns that block COMING SOON alerts (reissues, live albums, deluxe re-packages).
-exclude_upcoming_title = [
-  '\bdeluxe\b', '\banniversary\b', '\bremaster', '\blive\b', '\bedition\b', '\bgreatest hits\b',
-  '\bbest of\b', '\bessentials\b', '\bexpanded\b', '\bcollection\b',
 ]
 exclude_artists = ["Various Artists"]

@@ -2,13 +2,16 @@ name: Release Radar
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # full check every 5 min (GitHub may start it a few minutes late)
-    - cron: "17 10 * * 4"     # Thursday burst: New Zealand midnight on release day (11:00-12:00 UTC)
-    - cron: "17 3 * * 5"      # Friday burst: US midnight on release day (04:00-05:00 UTC)
+    - cron: "*/5 * * * *"     # full check (GitHub usually starts these every 10-20 min in practice)
+    # Release windows, every day: quick new-drop checks every 20s around local midnight.
+    # Two start times each, because daylight saving moves midnight by an hour; the one that
+    # isn't near midnight exits straight away.
+    - cron: "17 10,11 * * *"  # New Zealand midnight (11:00 or 12:00 UTC)
+    - cron: "17 3,4 * * *"    # US Eastern midnight (04:00 or 05:00 UTC)
   workflow_dispatch:          # "Run workflow" button in the Actions tab
     inputs:
-      burst_minutes:
-        description: "Check about every minute for this many minutes (0 = one full check)"
+      watch_minutes:
+        description: "Watch for new drops every 20s for this many minutes (0 = one full check)"
         default: "0"
 
 permissions:
@@ -49,17 +52,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYTHONUNBUFFERED: "1"
           SCHEDULE: ${{ github.event.schedule }}
-          BURST_INPUT: ${{ inputs.burst_minutes }}
+          WATCH_MINUTES: ${{ inputs.watch_minutes }}
         run: |
           case "$SCHEDULE" in
-            "17 10 * * 4"|"17 3 * * 5") minutes=150 ;;   # covers both summer and winter time
-            *) minutes="${BURST_INPUT:-0}" ;;
+            "17 10,11 * * *"|"17 3,4 * * *")
+              python -m radar watch --state state/state.json --save-cmd "bash .github/save-state.sh" ;;
+            *)
+              if [ "${WATCH_MINUTES:-0}" != "0" ]; then
+                python -m radar watch --minutes "$WATCH_MINUTES" --state state/state.json --save-cmd "bash .github/save-state.sh"
+              else
+                timeout 10m python -m radar run --state state/state.json
+              fi ;;
           esac
-          if [ "$minutes" -gt 0 ]; then
-            bash .github/burst.sh "$minutes"
-          else
-            timeout 10m python -m radar run --state state/state.json
-          fi
 
       # Runs even if the step above failed part-way, so posted songs are never posted twice.
       - name: Save state

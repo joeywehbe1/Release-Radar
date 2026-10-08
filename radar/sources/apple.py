@@ -1,8 +1,10 @@
-"""Apple Music / iTunes: US charts (overall + per genre), artist lookups, release-date lookups and search."""
+"""Apple Music / iTunes: US charts, artists' newest releases and songs, playability per storefront, search."""
 from __future__ import annotations
 
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -15,17 +17,19 @@ MOST_PLAYED = "https://rss.marketingtools.apple.com/api/v2/{cc}/music/most-playe
 GENRE_CHART = "https://itunes.apple.com/{cc}/rss/topsongs/limit=100/genre={gid}/json"
 LOOKUP = "https://itunes.apple.com/lookup"
 SEARCH = "https://itunes.apple.com/search"
+RELEASE_BATCH = 200   # artist ids per release lookup (Apple's maximum)
 
 _ARTIST_ID = re.compile(r"/(\d+)(?:\?|$)")
 
 
+def _fresh(params: dict) -> dict:
+    """Apple's CDN answers repeated identical lookups from a cache that can be 24h old,
+    which would hide new releases. A unique value makes every lookup a fresh one."""
+    return {**params, "_": str(time.time_ns())}
+
+
 def _strip_uo(url: str | None) -> str | None:
     return re.sub(r"[?&]uo=\d+$", "", url) if url else url
-
-
-def to_storefront(url: str | None, cc: str) -> str | None:
-    """music.apple.com/nz/... -> music.apple.com/us/... (ids are the same in every country)."""
-    return re.sub(r"(music\.apple\.com/)[a-z]{2}/", rf"\g<1>{cc}/", url) if url else url
 
 
 def album_url(url: str | None) -> str | None:
@@ -83,56 +87,81 @@ def _track_candidate(r: dict, source: str) -> Candidate:
 
 
 def latest_songs(session: requests.Session, cc: str, artist_ids: list[str], *, batch_size: int,
-                 per_artist: int, throttle: Throttle, pause: float, home_cc: str | None = None) -> list[Candidate]:
-    """Newest songs for each artist id in storefront `cc` (batched lookups; Apple only returns songs
-    that are already out there). Links point at `home_cc`. A failed batch is skipped, not fatal."""
+                 per_artist: int, throttle: Throttle, pause: float) -> list[Candidate]:
+    """Newest songs for each artist id (batched lookups). A failed batch is skipped, not fatal."""
     out = []
     for start in range(0, len(artist_ids), batch_size):
         chunk = artist_ids[start:start + batch_size]
         throttle.wait("itunes", pause)
         try:
-            data = get_json(session, LOOKUP, params={
+            data = get_json(session, LOOKUP, params=_fresh({
                 "id": ",".join(chunk), "entity": "song", "sort": "recent",
                 "limit": per_artist, "country": cc,
-            })
+            }))
         except Exception as exc:  # keep going with the other batches
-            log.warning("iTunes %s lookup batch %d failed: %s", cc.upper(), start // batch_size + 1, exc)
+            log.warning("iTunes lookup batch %d failed: %s", start // batch_size + 1, exc)
             continue
         for r in data.get("results", []):
             if r.get("wrapperType") == "track" and r.get("kind") == "song":
-                c = _track_candidate(r, "watchlist")
-                c.extra["storefront"] = cc
-                if home_cc and cc != home_cc:
-                    c.url, c.collection_url = to_storefront(c.url, home_cc), to_storefront(c.collection_url, home_cc)
-                out.append(c)
+                out.append(_track_candidate(r, "watchlist"))
     return out
 
 
-def upcoming_releases(session: requests.Session, cc: str, artist_ids: list[str], *, batch_size: int,
-                      throttle: Throttle, pause: float, now: int) -> list[Candidate]:
-    """Announced albums/singles (pre-orders): collections whose release date is still ahead."""
-    out = []
-    for start in range(0, len(artist_ids), batch_size):
+def latest_releases(session: requests.Session, cc: str, artist_ids: list[str], *,
+                    throttle: Throttle, pause: float) -> list[Candidate]:
+    """Each artist's 3 newest releases (albums, EPs, singles), including announced pre-orders.
+    Batches run side by side to keep quick checks quick; raises only if every batch failed."""
+    def lookup(chunk: list[str]) -> dict:
         throttle.wait("itunes", pause)
-        try:
-            data = get_json(session, LOOKUP, params={
-                "id": ",".join(artist_ids[start:start + batch_size]), "entity": "album", "sort": "recent",
-                "limit": 3, "country": cc,
-            })
-        except Exception as exc:
-            log.warning("iTunes upcoming batch %d failed: %s", start // batch_size + 1, exc)
-            continue
-        for r in data.get("results", []):
-            release = parse_time(r.get("releaseDate"))
-            if r.get("wrapperType") != "collection" or not release or release <= now:
+        return get_json(session, LOOKUP, params=_fresh({
+            "id": ",".join(chunk), "entity": "album", "sort": "recent", "limit": 3, "country": cc,
+        }))
+
+    chunks = [artist_ids[i:i + RELEASE_BATCH] for i in range(0, len(artist_ids), RELEASE_BATCH)]
+    out, errors = [], []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for future in [pool.submit(lookup, chunk) for chunk in chunks]:
+            try:
+                data = future.result()
+            except Exception as exc:
+                errors.append(exc)
                 continue
-            out.append(Candidate(
-                source="upcoming", artist=r.get("artistName", ""), title=r.get("collectionName", ""),
-                release=release, genre=r.get("primaryGenreName"),
-                artist_id=str(r["artistId"]) if r.get("artistId") else None, artwork=r.get("artworkUrl100"),
-                collection=r.get("collectionName"), collection_id=str(r["collectionId"]),
-                collection_url=album_url(r.get("collectionViewUrl")), track_count=r.get("trackCount"),
-            ))
+            for r in data.get("results", []):
+                if r.get("wrapperType") != "collection" or not r.get("collectionId"):
+                    continue
+                out.append(Candidate(
+                    source="release", artist=r.get("artistName", ""), title=r.get("collectionName", ""),
+                    release=parse_time(r.get("releaseDate")), genre=r.get("primaryGenreName"),
+                    artist_id=str(r["artistId"]) if r.get("artistId") else None, artwork=r.get("artworkUrl100"),
+                    collection=r.get("collectionName"), collection_id=str(r["collectionId"]),
+                    collection_url=album_url(r.get("collectionViewUrl")), track_count=r.get("trackCount"),
+                    extra={"collection_artist": r.get("artistName", "")},
+                ))
+    if errors and len(errors) == len(chunks):
+        raise errors[0]
+    for exc in errors:
+        log.warning("iTunes release lookup batch failed: %s", exc)
+    return out
+
+
+def playability(session: requests.Session, cc: str, collection_ids: list[str], *,
+                throttle: Throttle, pause: float) -> dict[str, dict]:
+    """How much of each release can be played in storefront `cc` right now. Before release day only
+    the pre-release singles are playable; once it's out, all of its tracks are.
+    Returns {collection id: {"playable": n, "total": n, "titles": first track names}}."""
+    out: dict[str, dict] = {}
+    for start in range(0, len(collection_ids), 50):
+        throttle.wait("itunes", pause)
+        data = get_json(session, LOOKUP, params=_fresh({
+            "id": ",".join(collection_ids[start:start + 50]), "entity": "song", "limit": 200, "country": cc,
+        }))
+        tracks = [r for r in data.get("results", []) if r.get("wrapperType") == "track" and r.get("kind") == "song"]
+        for r in sorted(tracks, key=lambda r: (r.get("discNumber") or 1, r.get("trackNumber") or 0)):
+            s = out.setdefault(str(r["collectionId"]), {"playable": 0, "total": 0, "titles": []})
+            s["total"] += 1
+            s["playable"] += bool(r.get("isStreamable"))
+            if len(s["titles"]) < 5:
+                s["titles"].append(r.get("trackName", ""))
     return out
 
 
@@ -142,7 +171,7 @@ def release_dates(session: requests.Session, cc: str, track_ids: list[str], *,
     found: dict[str, int] = {}
     for start in range(0, len(track_ids), 150):
         throttle.wait("itunes", pause)
-        data = get_json(session, LOOKUP, params={"id": ",".join(track_ids[start:start + 150]), "country": cc})
+        data = get_json(session, LOOKUP, params=_fresh({"id": ",".join(track_ids[start:start + 150]), "country": cc}))
         for r in data.get("results", []):
             ts = parse_time(r.get("releaseDate"))
             if r.get("trackId") and ts:
@@ -154,9 +183,9 @@ def search_song(session: requests.Session, cc: str, artist: str, title: str, *,
                 throttle: Throttle, pause: float) -> Candidate | None:
     """Find a song on Apple Music by artist + title (for songs first seen on YouTube/Deezer)."""
     throttle.wait("itunes", pause)
-    data = get_json(session, SEARCH, params={
+    data = get_json(session, SEARCH, params=_fresh({
         "term": f"{artist} {title}", "media": "music", "entity": "song", "limit": 10, "country": cc,
-    })
+    }))
     want_artist, want_title = primary_artist(artist), title_norm(title)
     for r in data.get("results", []):
         if r.get("kind") != "song":

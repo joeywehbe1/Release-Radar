@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -23,7 +24,8 @@ HOUR = 3600
 DAY = 86400
 SNAPSHOT_EVERY = 3 * HOUR
 APPLE_SEARCHES_PER_RUN = 10
-UPCOMING_EVERY = 30 * 60   # pre-orders aren't minute-critical; checking less often spares the iTunes rate limit
+DUE_AHEAD = 36 * HOUR   # Apple's release dates are placeholders that can trail the real release by a day
+OUT_SHARE = 0.75        # a release is out once this share of its tracks is playable
 
 
 class LiveFetchers:
@@ -51,19 +53,19 @@ class LiveFetchers:
         return out
 
     def watchlist(self, artist_ids: list[str]) -> list[Candidate]:
-        """Newest songs per artist, checked in the earliest time zones first (New Zealand reaches
-        midnight on release day ~17h before the US), then the home storefront."""
         w = self.cfg["watchlist"]
-        out: list[Candidate] = []
-        for cc in dict.fromkeys([*w.get("early_storefronts", []), self.cc]):
-            out += apple.latest_songs(self.session, cc, artist_ids, batch_size=w["batch_size"],
-                                      per_artist=w["per_artist_limit"], throttle=self.throttle,
-                                      pause=self.pause, home_cc=self.cc)
-        return out
+        return apple.latest_songs(self.session, self.cc, artist_ids, batch_size=w["batch_size"],
+                                  per_artist=w["per_artist_limit"], throttle=self.throttle, pause=self.pause)
 
-    def upcoming(self, artist_ids: list[str], now: int) -> list[Candidate]:
-        return apple.upcoming_releases(self.session, self.cc, artist_ids, batch_size=self.cfg["watchlist"]["batch_size"],
-                                       throttle=self.throttle, pause=self.pause, now=now)
+    def releases(self, artist_ids: list[str]) -> list[Candidate]:
+        return apple.latest_releases(self.session, self.cc, artist_ids, throttle=self.throttle, pause=self.pause)
+
+    def playability(self, collection_ids: list[str]) -> dict[str, dict[str, dict]]:
+        """{storefront: {collection id: playable/total}}, earliest time zone first: New Zealand
+        reaches midnight on release day about 17 hours before the US."""
+        stores = dict.fromkeys([*self.cfg["watchlist"].get("early_storefronts", []), self.cc])
+        return {cc: apple.playability(self.session, cc, collection_ids, throttle=self.throttle, pause=self.pause)
+                for cc in stores}
 
     def apple_release_dates(self, track_ids: list[str]) -> dict[str, int]:
         return apple.release_dates(self.session, self.cc, track_ids, throttle=self.throttle, pause=self.pause)
@@ -92,13 +94,13 @@ class LiveFetchers:
 
 @dataclass
 class Alert:
-    kind: str                 # "new" (NEW DROP), "viral" (GOING VIRAL) or "soon" (COMING SOON)
-    key: str                  # "rel:<collection id>" for new drops, "up:<artist>|<title>" for coming soon, else the song key
+    kind: str                 # "new" (NEW DROP) or "viral" (GOING VIRAL)
+    key: str                  # "rel:<artist id>|<release title>" for new drops, the song key for viral
     score: float
     heat: float
-    track: dict               # the lead song
-    tracks: list[dict] = field(default_factory=list)  # every song in a new release
-    also: list[dict] = field(default_factory=list)    # lead songs of the artist's other same-day releases
+    track: dict               # the release (new drop) or song (viral)
+    tracks: list[dict] = field(default_factory=list)  # a new release's first tracks
+    also: list[dict] = field(default_factory=list)    # the artist's other releases out at the same time
     release_keys: list[str] = field(default_factory=list)
 
 
@@ -114,8 +116,8 @@ class CycleResult:
 # ---------------------------------------------------------------- the cycle
 
 def run_cycle(cfg: dict, state: dict, fetchers, now: int, fast: bool = False) -> CycleResult:
-    """A full check, or with fast=True a quick NEW DROP-only check of the artists hot enough to
-    trigger one (used every minute around release time, between full checks)."""
+    """A full check, or with fast=True a quick NEW DROP-only check (used every few seconds
+    around release time)."""
     stats: dict[str, int] = {}
     window = cfg["alerts"]["viral_max_age_days"] * DAY
     manual_heat = cfg["watchlist"]["manual_artist_heat"]
@@ -134,16 +136,8 @@ def run_cycle(cfg: dict, state: dict, fetchers, now: int, fast: bool = False) ->
     bad_artists = {a.lower() for a in cfg["filters"]["exclude_artists"]}
 
     if fast:
-        watch_ids = _hot_artist_ids(state, now, cfg, min_heat=cfg["alerts"]["new_drop_min_heat"])
-        stats["watched artists"] = len(watch_ids)
-        watch = collect("watchlist", fetchers.watchlist, watch_ids) if watch_ids else []
-        index = _build_index(state)
-        for c in watch:
-            _ingest(state, index, c, now, window, junk, bad_artists)
-        history_ok = state["created"] is not None and now - state["created"] >= scoring.CLIMB_LOOKBACK
-        ranked = _score_all(state, now, window, history_ok, cfg, manual_heat)
-        eligible = _decide(state, ranked, now, cfg, viral=False)
-        return CycleResult(is_bootstrap(state), _apply_caps(state, eligible, now, cfg), eligible, ranked, stats)
+        drops = _detect_drops(state, fetchers, now, cfg, stats, manual_heat)
+        return CycleResult(is_bootstrap(state), _apply_caps(state, drops, now, cfg), drops, [], stats)
 
     charts = collect("charts", fetchers.charts)
     _fill_apple_dates(state, charts, fetchers, now)
@@ -157,11 +151,7 @@ def run_cycle(cfg: dict, state: dict, fetchers, now: int, fast: bool = False) ->
     yt = collect("youtube", fetchers.youtube)
     rd = collect("reddit", fetchers.reddit)
 
-    soon: list[Alert] = []
-    if now - state.get("upcoming_checked", 0) >= UPCOMING_EVERY:
-        state["upcoming_checked"] = now
-        soon_ids = _hot_artist_ids(state, now, cfg, min_heat=cfg["alerts"]["new_drop_min_heat"])
-        soon = _decide_upcoming(state, collect("upcoming", fetchers.upcoming, soon_ids, now), now, cfg, manual_heat)
+    drops = _detect_drops(state, fetchers, now, cfg, stats, manual_heat)
 
     for t in state["tracks"].values():
         t["pos"] = {}  # positions are re-read every run
@@ -177,7 +167,7 @@ def run_cycle(cfg: dict, state: dict, fetchers, now: int, fast: bool = False) ->
 
     history_ok = state["created"] is not None and now - state["created"] >= scoring.CLIMB_LOOKBACK
     ranked = _score_all(state, now, window, history_ok, cfg, manual_heat)
-    eligible = _decide(state, ranked, now, cfg) + soon
+    eligible = drops + _decide(state, ranked, now, cfg)
     return CycleResult(is_bootstrap(state), _apply_caps(state, eligible, now, cfg), eligible, ranked, stats)
 
 
@@ -337,11 +327,7 @@ def _merge(track: dict, c: Candidate, now: int) -> None:
     if c.position is not None and c.kind in ("apple_top", "genre", "deezer_chart", "youtube"):
         prev = track["pos"].get(c.source)
         track["pos"][c.source] = min(prev, c.position) if prev else c.position
-    if c.kind == "watchlist":
-        track["wl_seen"] = now
-        if c.extra.get("storefront"):  # when the song first went live in each storefront
-            track.setdefault("live", {}).setdefault(c.extra["storefront"], now)
-    elif c.kind == "deezer_chart":
+    if c.kind == "deezer_chart":
         track["deezer"] = {"id": c.extra["deezer_id"], "url": c.extra.get("deezer_url"),
                            "rank": c.extra.get("deezer_rank"), "ts": now}
     elif c.kind == "youtube":
@@ -435,75 +421,85 @@ def _score_all(state: dict, now: int, window: int, history_ok: bool, cfg: dict, 
     return ranked
 
 
-def _decide(state: dict, ranked: list[tuple[float, dict]], now: int, cfg: dict, viral: bool = True) -> list[Alert]:
+def _detect_drops(state: dict, fetchers, now: int, cfg: dict, stats: dict, manual_heat: float) -> list[Alert]:
+    """NEW DROP: a hot artist's release whose tracks just became playable, in New Zealand first, then
+    the US. Works per release, because a brand-new album's tracks often come without a release date."""
     al = cfg["alerts"]
-    new_drop_junk = compile_patterns(cfg["filters"]["exclude_new_drop_title"])
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for _, t in ranked:
-        if t.get("wl_seen") != now or t["alerted"].get("new"):
-            continue
-        if now - t["release"] > al["new_drop_max_age_hours"] * HOUR or t["heat"] < al["new_drop_min_heat"]:
-            continue
-        if matches_any(t["title"], new_drop_junk):
-            continue
-        gkey = f"rel:{t.get('collection_id') or t['key']}"
-        if gkey not in state["releases"]:
-            groups[gkey].append(t)
-    # One NEW DROP per artist per run: the biggest release leads, other same-day releases ride along.
-    by_artist: dict[str, list[tuple[str, list[dict]]]] = defaultdict(list)
-    for gkey, ts in groups.items():
-        by_artist[ts[0].get("artist_id") or ts[0]["anorm"]].append((gkey, ts))
-    alerts = []
-    for releases in by_artist.values():
-        releases.sort(key=lambda r: ((r[1][0].get("track_count") or 1), r[1][0]["score"]), reverse=True)
-        lead = releases[0][1][0]
-        extras = [r[1][0] for r in releases[1:]]
-        alerts.append(Alert("new", releases[0][0], lead["score"], lead["heat"], lead, releases[0][1],
-                            also=extras, release_keys=[g for g, _ in releases]))
-
-    if not viral:
-        return alerts
-    in_new_drop = {t["key"] for a in alerts for t in a.tracks + a.also}
-    for score, t in ranked:
-        if score < al["viral_threshold"]:
-            break
-        if t["alerted"].get("viral") or t["key"] in in_new_drop or not t["parts"]["moving"]:
-            continue
-        new_at = t["alerted"].get("new")
-        if new_at and now - new_at < al["viral_after_new_drop_hours"] * HOUR:
-            continue
-        alerts.append(Alert("viral", t["key"], score, t["heat"], t, [t]))
-    return alerts
-
-
-def _decide_upcoming(state: dict, cands: list[Candidate], now: int, cfg: dict, manual_heat: float) -> list[Alert]:
-    """COMING SOON: a hot artist's pre-order, the first time Apple lists it. The very first check only
-    records what's already listed, so weeks-old announcements don't flood the channel."""
-    seen = state["upcoming"]
-    seeding = not state.get("upcoming_seeded")
-    junk = compile_patterns(cfg["filters"]["exclude_title"] + cfg["filters"]["exclude_upcoming_title"])
+    hot = _hot_artist_ids(state, now, cfg, min_heat=al["new_drop_min_heat"])
+    if not hot:
+        return []
+    try:
+        releases = fetchers.releases(hot)
+    except Exception as exc:
+        log.warning("release lookup failed: %s", exc)
+        return []
+    stats["releases"] = len(releases)
+    junk = compile_patterns(cfg["filters"]["exclude_title"] + cfg["filters"]["exclude_new_drop_title"])
     bad_artists = {a.lower() for a in cfg["filters"]["exclude_artists"]}
-    alerts = []
-    for c in cands:
-        # Clean and explicit editions are separate collections; key on artist + title so they alert once.
-        key = f"up:{c.artist_id or primary_artist(c.artist)}|{title_norm(c.title)}"
-        if key in seen or any(a.key == key for a in alerts):
+    due: dict[str, list[Candidate]] = defaultdict(list)
+    for c in releases:
+        if c.release is None or not now - al["new_drop_max_age_hours"] * HOUR <= c.release <= now + DUE_AHEAD:
             continue
         if matches_any(c.title, junk) or c.artist.strip().lower() in bad_artists:
             continue
-        if seeding:
-            seen[key] = [now, c.release]
-            continue
-        artist = state["artists"].get(c.artist_id or "")
+        # Clean and explicit editions are separate releases; one key covers both.
+        key = f"rel:{c.artist_id or primary_artist(c.artist)}|{title_norm(c.title)}"
+        # "rel:<collection id>" is how earlier versions recorded a posted release.
+        if key not in state["releases"] and f"rel:{c.collection_id}" not in state["releases"]:
+            due[key].append(c)
+    stats["due"] = len(due)
+    if not due:
+        return []
+    try:
+        status = fetchers.playability([c.collection_id for editions in due.values() for c in editions])
+    except Exception as exc:
+        log.warning("playability check failed: %s", exc)
+        return []
+
+    by_artist: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for key, editions in due.items():
+        live, best = {}, None
+        for c in editions:
+            for cc, by_id in status.items():
+                s = by_id.get(c.collection_id)
+                if s and s["total"] and s["playable"] / s["total"] >= OUT_SHARE:
+                    live.setdefault(cc, now)
+                    best = best or (c, s)
+        if not live:
+            continue  # announced, not out yet
+        c, s = best
+        release = {
+            "key": key, "anorm": primary_artist(c.artist), "artist": c.artist, "artist_id": c.artist_id,
+            "title": re.sub(r"\s+-\s+(?:Single|EP)$", "", c.title), "release": min(c.release, now),
+            "genre": c.genre, "artwork": c.artwork, "collection": c.collection, "collection_url": c.collection_url,
+            "apple_url": c.collection_url, "collection_artist": c.artist,
+            "track_count": c.track_count or s["total"], "live": live,
+        }
+        by_artist[c.artist_id or release["anorm"]].append((key, {**release, "titles": s["titles"]}))
+
+    alerts = []
+    for releases_out in by_artist.values():  # one alert per artist: the biggest release leads
+        releases_out.sort(key=lambda r: r[1]["track_count"] or 1, reverse=True)
+        key, lead = releases_out[0]
+        artist = state["artists"].get(lead["artist_id"] or "")
         heat = scoring.effective_heat(artist, now, manual_heat) if artist else 0.0
-        if heat < cfg["alerts"]["new_drop_min_heat"]:
+        alerts.append(Alert("new", key, 0.0, heat, lead, [{"title": t} for t in lead["titles"]],
+                            also=[r for _, r in releases_out[1:]], release_keys=[k for k, _ in releases_out]))
+    return alerts
+
+
+def _decide(state: dict, ranked: list[tuple[float, dict]], now: int, cfg: dict) -> list[Alert]:
+    """GOING VIRAL: recent songs whose score clears the threshold and that are actually accelerating."""
+    al = cfg["alerts"]
+    just_dropped = {s[3] for s in state["sent"]
+                    if s[1] == "new" and len(s) > 3 and now - s[0] < al["viral_after_new_drop_hours"] * HOUR}
+    alerts = []
+    for score, t in ranked:
+        if score < al["viral_threshold"]:
+            break
+        if t["alerted"].get("viral") or not t["parts"]["moving"] or t["anorm"] in just_dropped:
             continue
-        track = {"key": key, "anorm": primary_artist(c.artist), "artist": c.artist, "title": c.title,
-                 "release": c.release, "genre": c.genre, "artwork": c.artwork, "collection": c.collection,
-                 "collection_url": c.collection_url, "apple_url": c.collection_url, "track_count": c.track_count}
-        alerts.append(Alert("soon", key, 0.0, heat, track, [track]))
-    if seeding and cands:
-        state["upcoming_seeded"] = True
+        alerts.append(Alert("viral", t["key"], score, t["heat"], t, [t]))
     return alerts
 
 
@@ -513,10 +509,15 @@ def _apply_caps(state: dict, eligible: list[Alert], now: int, cfg: dict) -> list
     left = {
         "new": al["max_new_drops_per_day"] - sum(1 for s in recent if s[1] == "new"),
         "viral": al["max_viral_per_day"] - sum(1 for s in recent if s[1] == "viral"),
-        "soon": al["max_coming_soon_per_day"] - sum(1 for s in recent if s[1] == "soon"),
     }
-    per_artist = Counter(s[3] for s in recent if s[1] == "viral" and len(s) > 3)
     out = []
+    # New drops first: they're the time-critical ones. Hottest artists first.
+    for a in sorted((a for a in eligible if a.kind == "new"), key=lambda a: a.heat, reverse=True):
+        if left["new"] <= 0:
+            break
+        left["new"] -= 1
+        out.append(a)
+    per_artist = Counter(s[3] for s in recent if s[1] == "viral" and len(s) > 3)
     for a in sorted((a for a in eligible if a.kind == "viral"), key=lambda a: a.score, reverse=True):
         if left["viral"] <= 0:
             break
@@ -525,12 +526,6 @@ def _apply_caps(state: dict, eligible: list[Alert], now: int, cfg: dict) -> list
         per_artist[a.track["anorm"]] += 1
         left["viral"] -= 1
         out.append(a)
-    for kind in ("new", "soon"):
-        for a in sorted((a for a in eligible if a.kind == kind), key=lambda a: (a.heat, a.score), reverse=True):
-            if left[kind] <= 0:
-                break
-            left[kind] -= 1
-            out.append(a)
     return out[:al["max_per_run"]]
 
 
@@ -538,9 +533,5 @@ def _mark(state: dict, a: Alert, now: int) -> None:
     if a.kind == "new":
         for key in a.release_keys or [a.key]:
             state["releases"][key] = now
-        for t in a.tracks + a.also:
-            t["alerted"]["new"] = now
-    elif a.kind == "soon":
-        state["upcoming"][a.key] = [now, a.track["release"]]
     else:
         a.track["alerted"]["viral"] = now

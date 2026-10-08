@@ -4,47 +4,50 @@ Posts the **newest music releases across all genres** to a Discord channel, and 
 with **potential to go viral**. A Discord webhook only *receives* messages; this project is the part
 that finds releases and sends them.
 
-It posts three kinds of alerts to one channel:
+It posts two kinds of alerts to one channel:
 
-- 🆕 **NEW DROP**: a release from the last 24 hours by an artist who is charting right now. Albums
-  and same-day singles are grouped into one message.
+- 🆕 **NEW DROP**: a release from the last 24 hours by an artist who is charting right now, posted
+  the moment its tracks become playable. An artist's album and same-day singles are grouped into
+  one message.
 - 🔥 **GOING VIRAL**: a song from the last 3 days that is *accelerating*. It must be climbing the
   charts, be a new chart entry, be racking up YouTube views fast, or be getting Reddit buzz, and
   its viral score (0–100) must clear the threshold.
-- 📅 **COMING SOON**: a hot artist's album or single, the moment Apple lists it for pre-order.
 
-Each alert includes artwork, release time, viral score, artist heat, the signals behind it
-(e.g. "Apple Music US Top 100 #12 · ▲34", "YouTube trending #8 · 85K/hr"), and links to Apple
-Music, Spotify, YouTube and Deezer.
+Each alert includes artwork, release time, artist heat, the signals behind it (e.g. "Apple Music US
+Top 100 #12 · ▲34", "YouTube trending #8 · 85K/hr"), and links to Apple Music, Spotify, YouTube and
+Deezer.
 
 ## How fast it is
 
-Most music comes out on **Global Release Day**: Friday at midnight *local time* in every country.
-New Zealand gets there first, about 17 hours before the US East Coast. So the radar checks
-Apple's **New Zealand store** as well as the US store. A song that's out in NZ gets posted right
-away with "🌏 Out now in New Zealand", hours before US listeners can play it.
+Releases go live at **midnight local time** (most of all on Fridays, Global Release Day), and
+**New Zealand gets there first**, about 17 hours before the US East Coast. For the ~230 artists hot
+enough for a NEW DROP, the radar looks up their newest releases on Apple Music (including announced
+ones) and checks whether each release's tracks are **playable yet** in the New Zealand and US
+stores. As soon as a release unlocks, it's posted; if it unlocked in NZ first, the alert says
+"🌏 Out now in New Zealand", hours before US listeners can play it.
 
-| When | What runs |
+| When (UTC, follows daylight saving) | What runs |
 |---|---|
-| All week | A full check every **5 minutes**. GitHub often starts these a few minutes late. |
-| Thursday 10:17–12:47 UTC (NZ midnight) | A quick new-drop check about **every minute**, plus a full check every 10 minutes |
-| Friday 03:17–05:47 UTC (US midnight) | Same as Thursday |
+| Every day, ~50 min before to 40 min after **New Zealand midnight** (11:00 or 12:00 UTC) | A quick new-drop check **every 20 seconds** |
+| Every day, the same around **US Eastern midnight** (04:00 or 05:00 UTC) | Same; on Fridays both windows run 100 min past midnight |
+| The rest of the time | A full check (all sources) every 5 minutes; GitHub usually starts these every 10–20 minutes |
 
-A new release from a charting artist reaches your channel within about a minute during those
-windows, and within about 5–10 minutes the rest of the week. Messages are only sent when
-something qualifies, never on a timer.
+Messages are only sent when something qualifies, never on a timer.
 
 ## Sources
 
 | Source | Used for | Checked |
 |---|---|---|
+| Apple Music: hot artists' newest releases + whether they're playable in NZ / US | **Finding NEW DROPs** | Every check, including the 20-second ones |
 | Apple Music US top 100 (streaming) | Who's hot; whether a song is climbing | Every full check (Apple updates it daily) |
 | 20 iTunes genre charts (Pop, Hip-Hop, R&B, Country, Latin, K-Pop, Afrobeats, Rock, Metal…) | Covers all genres | Every full check |
-| Apple Music artist lookup, NZ + US stores (the 400 hottest artists) | **Finding NEW DROPs** | Every check, including the quick ones |
-| Apple Music pre-orders (hot artists) | **COMING SOON** | Every 30 minutes |
+| Apple Music: hot artists' newest songs | Feeding the viral score | Every full check |
 | YouTube trending music (top ~30 videos) | Views per hour, the strongest viral signal | Every full check |
 | Deezer | Popularity score and chart position on a second platform | Every full check |
 | Reddit `[FRESH]` posts | Fan-community buzz; often blocked from GitHub | Every full check |
+
+Apple's servers cache identical requests for up to a day, so every lookup is made unique to get
+fresh data.
 
 ## Setup (about 15 minutes)
 
@@ -103,8 +106,13 @@ Fetches live data and prints what *would* be posted. It posts nothing and saves 
 ```bash
 py -m radar run
 ```
-One real full check. State is saved to `state/state.json`. Add `--fast` for a quick new-drops-only
-check, the kind the release-window bursts run every minute.
+One real full check. State is saved to `state/state.json`.
+
+```bash
+py -m radar watch --minutes 10
+```
+Quick new-drop checks every 20 seconds for 10 minutes. This posts for real. Without `--minutes` it
+only runs inside a release window.
 
 ```bash
 py -m pytest
@@ -119,8 +127,9 @@ Runs the tests.
 | `new_drop_max_age_hours` | 24 | How fresh a NEW DROP must be. |
 | `viral_max_age_days` | 3 | How recent a song must be to go viral. |
 | `viral_threshold` | 55 | Viral score needed for GOING VIRAL. Raise it for fewer, bigger alerts. |
-| `max_new_drops_per_day` / `max_viral_per_day` / `max_coming_soon_per_day` | 25 / 12 / 6 | Daily caps. Most days stay well under these; release days can hit the NEW DROP cap. |
+| `max_new_drops_per_day` / `max_viral_per_day` | 25 / 12 | Daily caps. Most days stay well under these; release days can hit the NEW DROP cap. |
 | `early_storefronts` | `["nz"]` | Extra Apple stores checked for early releases. Add `"au"` for Australia too. |
+| `[bursts]` | NZ + US Eastern, every 20s | Release windows: time zones, how long before/after midnight, check interval. |
 | `max_viral_per_artist_per_day` | 1 | Stops one album from taking over the channel. |
 | `[weights]` | 30/30/20/15/5 | Viral score mix: artist heat, chart momentum, YouTube velocity, cross-platform, Reddit. |
 | `[genres]` | 20 genres | Add or remove Apple genre charts. |

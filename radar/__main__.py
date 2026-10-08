@@ -1,13 +1,14 @@
-"""CLI: `python -m radar run [--dry-run]` and `python -m radar test-webhook`."""
+"""CLI: `python -m radar run [--dry-run]`, `python -m radar watch` and `python -m radar test-webhook`."""
 from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-from radar import notify, pipeline
+from radar import notify, pipeline, schedule
 from radar import state as state_mod
 from radar.config import load_config, webhook_url
 from radar.http import make_session
@@ -25,9 +26,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     run_p = sub.add_parser("run", help="check every source once and post new alerts")
     run_p.add_argument("--dry-run", action="store_true", help="print what would be posted; don't post or save state")
-    run_p.add_argument("--fast", action="store_true", help="quick check: only hot artists' newest songs (NEW DROP)")
     run_p.add_argument("--state", default="state/state.json", help="state file (default: state/state.json)")
     run_p.add_argument("-v", "--verbose", action="store_true")
+    watch_p = sub.add_parser("watch", help="check for new drops every few seconds during release windows")
+    watch_p.add_argument("--state", default="state/state.json", help="state file (default: state/state.json)")
+    watch_p.add_argument("--minutes", type=float, default=0,
+                         help="watch for this long now (default: only inside the release windows in config.toml)")
+    watch_p.add_argument("--save-cmd", default="", help="shell command to run after each state save (e.g. push it)")
     sub.add_parser("test-webhook", help="post a test message to the webhook")
     args = parser.parse_args(argv)
 
@@ -41,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = notify.WebhookNotifier(webhook_url(), session).send(notify.test_payload(cfg))
         print("Test message sent. Check your Discord channel." if ok else "Test message failed (see error above).")
         return 0 if ok else 1
+    if args.cmd == "watch":
+        return watch(args, cfg, session)
     return run(args, cfg, session)
 
 
@@ -51,12 +58,9 @@ def run(args, cfg: dict, session) -> int:
     now = int(time.time())
     started = time.monotonic()
 
-    fast = args.fast and not state_mod.is_bootstrap(state)
-    if args.fast and not fast:
-        log.info("No saved state yet, so doing a full check instead of a quick one")
-    result = pipeline.run_cycle(cfg, state, pipeline.LiveFetchers(cfg, session), now, fast=fast)
+    result = pipeline.run_cycle(cfg, state, pipeline.LiveFetchers(cfg, session), now)
     _summary(result, cfg)
-    if not fast and not any(result.stats.get(k) for k in ("charts", "watchlist", "deezer", "youtube")):
+    if not any(result.stats.get(k) for k in ("charts", "watchlist", "deezer", "youtube")):
         log.error("Every source failed; nothing to do this run.")
         return 1
 
@@ -68,23 +72,70 @@ def run(args, cfg: dict, session) -> int:
     try:
         ok = pipeline.deliver(result, state, notify.WebhookNotifier(webhook, session), now, cfg)
     finally:
-        state["last_run"] = now
-        state_mod.prune(state, now, cfg)
-        state_mod.save(path, state)
+        _save(path, state, now, cfg)
     posted = 1 if result.bootstrap else len(result.alerts)
     log.info("Run finished in %.0fs: %s", time.monotonic() - started,
              "bootstrap message posted" if result.bootstrap else f"{posted} alert(s) posted")
     return 0 if ok else 1
 
 
+def watch(args, cfg: dict, session) -> int:
+    """Quick NEW DROP checks every `interval_seconds`, in one process, until the release window ends.
+    State is saved (and `--save-cmd` run) whenever something was posted, and every 10 minutes."""
+    started = time.time()
+    end = started + args.minutes * 60 if args.minutes else schedule.window_end(started, cfg["bursts"])
+    if end is None:
+        log.info("Not a release window right now; nothing to do.")
+        return 0
+    path = Path(args.state)
+    notifier = notify.WebhookNotifier(webhook_url(), session)
+    state = state_mod.load(path)
+    fetchers = pipeline.LiveFetchers(cfg, session)
+    interval = cfg["bursts"]["interval_seconds"]
+    logging.getLogger("radar.pipeline").setLevel(logging.WARNING)  # one summary line per check instead
+    log.info("Watching for new drops every %ds until %s UTC", interval, time.strftime("%H:%M", time.gmtime(end)))
+
+    checks = posted = 0
+    all_ok = True
+    last_save = time.monotonic()
+    try:
+        while time.time() < end:
+            tick = time.monotonic()
+            now = int(time.time())
+            fast = not state_mod.is_bootstrap(state)  # a brand-new state needs one full check first
+            result = pipeline.run_cycle(cfg, state, fetchers, now, fast=fast)
+            all_ok = pipeline.deliver(result, state, notifier, now, cfg) and all_ok
+            checks += 1
+            posted += len(result.alerts)
+            log.info("check %d: %s releases, %d due, %d posted (%.1fs)", checks, result.stats.get("releases", "-"),
+                     result.stats.get("due", 0), len(result.alerts), time.monotonic() - tick)
+            if result.alerts or not fast or time.monotonic() - last_save > 600:
+                _save(path, state, now, cfg, args.save_cmd)
+                last_save = time.monotonic()
+            time.sleep(max(0.0, interval - (time.monotonic() - tick)))
+    finally:
+        _save(path, state, int(time.time()), cfg, args.save_cmd)
+    log.info("Watch finished: %d checks, %d alert(s) posted", checks, posted)
+    return 0 if all_ok else 1
+
+
+def _save(path: Path, state: dict, now: int, cfg: dict, save_cmd: str = "") -> None:
+    state["last_run"] = now
+    state_mod.prune(state, now, cfg)
+    state_mod.save(path, state)
+    if save_cmd and subprocess.run(save_cmd, shell=True).returncode != 0:
+        log.warning("State save command failed")
+
+
 def _summary(result: pipeline.CycleResult, cfg: dict) -> None:
-    kinds = {"new": 0, "viral": 0, "soon": 0}
+    kinds = {"new": 0, "viral": 0}
     for a in result.eligible:
         kinds[a.kind] += 1
     plan = ("bootstrap: 1 summary message, the rest marked as seen" if result.bootstrap
             else f"posting {len(result.alerts)} this run")
-    log.info("Scored %d recent songs; eligible: %d new drops, %d viral (threshold %s), %d coming soon; %s",
-             len(result.ranked), kinds["new"], kinds["viral"], cfg["alerts"]["viral_threshold"], kinds["soon"], plan)
+    log.info("Scored %d recent songs; %s releases due; eligible: %d new drops, %d viral (threshold %s); %s",
+             len(result.ranked), result.stats.get("due", 0), kinds["new"], kinds["viral"],
+             cfg["alerts"]["viral_threshold"], plan)
     for score, t in result.ranked[:10]:
         p = t["parts"]
         log.info("  %5.1f  %-45.45s heat %3.0f  mom %.2f  yt %.2f  x %.2f  rd %.0f",

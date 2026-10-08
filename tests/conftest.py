@@ -38,10 +38,18 @@ def song(artist, title, *, artist_id="1", release=T0 - 2 * HOUR, collection=None
                      extra={"collection_artist": artist})
 
 
-def preorder(artist, title, *, artist_id="1", release=T0 + 14 * DAY, collection_id=None, track_count=12):
-    return Candidate(source="upcoming", artist=artist, title=title, release=release, artist_id=artist_id,
-                     genre="Pop", collection=title, collection_id=collection_id or f"pre-{title}",
-                     collection_url=f"https://music.apple.com/us/album/{title}", track_count=track_count)
+def release(artist, title, *, artist_id="1", release=T0 - 2 * HOUR, collection_id=None, track_count=1):
+    """An artist's release as Apple's release lookup returns it (album, EP or '<title> - Single')."""
+    cid = collection_id or f"c-{artist_id}-{title}"
+    return Candidate(source="release", artist=artist, title=title, release=release, artist_id=artist_id,
+                     genre="Pop", collection=title, collection_id=cid, collection_url=f"https://music.apple.com/us/album/{cid}",
+                     track_count=track_count, artwork="https://is1-ssl.mzstatic.com/x/100x100bb.jpg",
+                     extra={"collection_artist": artist})
+
+
+def out(playable, total, titles=("Track 1", "Track 2", "Track 3")):
+    """Playability of one release in one storefront."""
+    return {"playable": playable, "total": total, "titles": list(titles)[:5]}
 
 
 def video(artist, title, views, *, published=T0 - DAY, pos=1):
@@ -53,9 +61,11 @@ def video(artist, title, views, *, published=T0 - DAY, pos=1):
 class FakeFetchers:
     """Same interface as pipeline.LiveFetchers; each field is a callable returning fresh candidates."""
 
-    def __init__(self, charts=(), watch=(), dz=(), yt=(), rd=(), deezer_ranks=None, apple_search=None, upcoming=()):
+    def __init__(self, charts=(), watch=(), dz=(), yt=(), rd=(), deezer_ranks=None, apple_search=None,
+                 releases=(), status=None):
         self._charts, self._watch, self._dz, self._yt, self._rd = charts, watch, dz, yt, rd
-        self._upcoming = upcoming
+        self._releases = releases
+        self._status = status  # {storefront: {collection id: out(...)}}; default: everything is out in the US
         self.deezer_ranks = deezer_ranks or {}
         self.searches = apple_search or {}
         self.calls = []
@@ -64,9 +74,16 @@ class FakeFetchers:
         self.calls.append("charts")
         return [copy.copy(c) for c in self._charts]
 
-    def upcoming(self, artist_ids, now):
-        self.calls.append("upcoming")
-        return [copy.copy(c) for c in self._upcoming if c.artist_id in artist_ids]
+    def releases(self, artist_ids):
+        self.calls.append("releases")
+        return [copy.copy(c) for c in self._releases if c.artist_id in artist_ids]
+
+    def playability(self, collection_ids):
+        self.calls.append("playability")
+        if self._status is None:
+            counts = {c.collection_id: c.track_count or 1 for c in self._releases}
+            return {"us": {cid: out(counts[cid], counts[cid]) for cid in collection_ids if cid in counts}}
+        return {cc: {cid: s for cid, s in by_id.items() if cid in collection_ids} for cc, by_id in self._status.items()}
 
     def watchlist(self, artist_ids):
         return [copy.copy(c) for c in self._watch if c.artist_id in artist_ids]
